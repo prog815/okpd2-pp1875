@@ -10,7 +10,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Текущий поисковый запрос и результаты
     let currentQuery = '';
     let currentResults = [];
-    let showingAllResults = false;
+    
     
     console.log('✅ Данные загружены:');
     console.log(`   • Основная таблица: ${okpd2MainData.length} записей`);
@@ -140,10 +140,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // 4. ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ
     // ============================================
     function displayResults(results, query, forceShowAll = false) {
-        // Если forceShowAll = true, показываем все результаты (кнопка "Показать все")
-        if (forceShowAll) {
-            showingAllResults = true;
-        }
+        // forceShowAll определяет, показывать все или только 50
         
         // Фильтруем результаты по выбранным приложениям
         const filteredResults = filterResults(results);
@@ -180,7 +177,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const sortedResults = sortResults(filteredResults, query);
         
         // Определяем, сколько результатов показывать
-        const resultsToShow = showingAllResults ? sortedResults : sortedResults.slice(0, 50);
+        const resultsToShow = forceShowAll ? sortedResults : sortedResults.slice(0, 50);
         
         // Создаём HTML таблицы
         const tableHtml = `
@@ -226,7 +223,7 @@ document.addEventListener('DOMContentLoaded', function() {
         let fullHtml = tableHtml; // Только таблица, без блока статистики
         
         // Добавляем кнопку "Показать все", если нужно
-        if (!showingAllResults && sortedResults.length > 50) {
+        if (!forceShowAll && sortedResults.length > 50) {
             fullHtml += `
                 <div class="more-results">
                     Показано: ${resultsToShow.length} из ${sortedResults.length} записей
@@ -239,7 +236,7 @@ document.addEventListener('DOMContentLoaded', function() {
         resultsContainer.innerHTML = fullHtml;
         
         // Добавляем обработчик кнопки "Показать все"
-        if (!showingAllResults && sortedResults.length > 50) {
+        if (!forceShowAll && sortedResults.length > 50) {
             document.getElementById('showAllBtn').addEventListener('click', function() {
                 displayResults(results, query, true); // forceShowAll = true
             });
