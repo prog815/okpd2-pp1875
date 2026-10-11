@@ -1,0 +1,105 @@
+name: Daily PP1875 Update
+
+on:
+  schedule:
+    - cron: '0 5 * * *'      # 05:00 UTC = 08:00 МСК
+  workflow_dispatch:          # ручной запуск
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write         # встроенный токен Actions для коммита
+    env:
+      # API-токен Kaggle НОВОГО образца (CLI >= 1.8.0 / kagglehub >= 0.4.1).
+      # Персональный токен этого справочника: не затрагивает другие
+      # справочники и legacy KAGGLE_KEY в okpd2.
+      # kaggle.json не нужен — CLI читает переменную окружения напрямую.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN_PP1875 }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Kaggle CLI с поддержкой API-токенов (>= 1.8.0)
+        run: |
+          pip install -q --upgrade kaggle
+          kaggle --version
+          python - <<'EOF'
+          import re, subprocess
+          out = subprocess.check_output(["kaggle", "--version"], text=True).strip()
+          m = re.search(r"(\d+)\.(\d+)", out)
+          assert m and tuple(map(int, m.groups())) >= (1, 8), \
+              f"нужен kaggle CLI >= 1.8.0 для API-токенов, получен: {out}"
+          print("OK: kaggle CLI поддерживает API-токены")
+          EOF
+
+      - name: Download latest kernel output
+        run: |
+          mkdir -p ./output
+          kaggle kernels output eavprog/pp1875-natsrezhim-downloader -p ./output
+          echo "Содержимое output:"
+          find ./output -maxdepth 4 -type f | head -30
+          echo ""
+          echo "--- Попытка показать лог/диагностику тетрадки (если есть) ---"
+          for f in ./output/*.log ./output/*.txt ./output/__notebook*.ipynb; do
+            [ -f "$f" ] && { echo ">>> $f (last 50 lines) >>>"; tail -n 50 "$f"; echo "<<< $f <<<"; echo ""; }
+          done || true
+
+      - name: Copy web files to repo root (не падает, ставит флаг)
+        id: copy
+        run: |
+          # Тетрадка PP1875 пишет файлы в корень /kaggle/working.
+          # При падении тетрадки output пуст — это достоверный признак сбоя.
+          # У этого справочника 6 файлов (три пары json/gz):
+          #   pp1875.*      — ОКПД2 со статусами нацрежима (основной для фронта);
+          #   pp1875_ref.*  — справочник трёх приложений (тултипы, названия пунктов);
+          #   pp1875_meta.* — метаданные (дата редакции, счётчики, hash).
+          SRC=./output
+          MISSING=0
+          for f in pp1875.json pp1875.json.gz \
+                   pp1875_ref.json pp1875_ref.json.gz \
+                   pp1875_meta.json pp1875_meta.json.gz; do
+            if [ -f "$SRC/$f" ]; then
+              cp "$SRC/$f" "./$f"
+              echo "copied $f"
+            else
+              echo "::warning::MISSING $f в output тетрадки (тетрадка, вероятно, упала)"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "❌ Отсутствует $MISSING из 6 файлов — коммит пропущен, сайт остаётся на последней хорошей версии"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "✅ Все 6 файлов на месте"
+            echo "FILES_OK=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit and push changes
+        if: env.FILES_OK == 'true'
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add pp1875.json pp1875.json.gz \
+                  pp1875_ref.json pp1875_ref.json.gz \
+                  pp1875_meta.json pp1875_meta.json.gz
+          if git diff --cached --quiet; then
+            echo "✅ Изменений нет — данные уже актуальны"
+          else
+            SOURCE_DATE=$(python -c "import json;print(json.load(open('pp1875_meta.json')).get('source_date','?'))")
+            git commit -m "Auto-update: PP 1875 data from kernel output (source $SOURCE_DATE) [skip ci]"
+            git push
+            echo "✅ Изменения запушены"
+          fi
+
+      - name: Trigger new notebook run (fire-and-forget, всегда)
+        if: always()
+        run: |
+          mkdir -p ./nb
+          kaggle kernels pull eavprog/pp1875-natsrezhim-downloader -p ./nb --metadata
+          kaggle kernels push -p ./nb
+          echo "✅ Тетрадка перезапущена (round-trip); workflow не ждёт её завершения"
