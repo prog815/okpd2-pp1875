@@ -7,15 +7,14 @@ on:
 
 jobs:
   sync-and-trigger:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write         # встроенный токен Actions для коммита
+      contents: write
     env:
       # API-токен Kaggle НОВОГО образца (CLI >= 1.8.0 / kagglehub >= 0.4.1).
       # Персональный токен этого справочника: не затрагивает другие
       # справочники и legacy KAGGLE_KEY в okpd2.
-      # kaggle.json не нужен — CLI читает переменную окружения напрямую.
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN_PP1875 }}
 
     steps:
@@ -24,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Kaggle CLI с поддержкой API-токенов (>= 1.8.0)
+      - name: Install Kaggle CLI (>= 1.8.0)
         run: |
           pip install -q --upgrade kaggle
           kaggle --version
@@ -41,46 +40,90 @@ jobs:
         run: |
           mkdir -p ./output
           kaggle kernels output eavprog/pp1875-natsrezhim-downloader -p ./output
-          echo "Содержимое output:"
+          echo "Содержимое output (find):"
           find ./output -maxdepth 4 -type f | head -30
           echo ""
-          echo "--- Попытка показать лог/диагностику тетрадки (если есть) ---"
+          echo "--- Хвост лога/диагностики тетрадки (если есть) ---"
           for f in ./output/*.log ./output/*.txt ./output/__notebook*.ipynb; do
             [ -f "$f" ] && { echo ">>> $f (last 50 lines) >>>"; tail -n 50 "$f"; echo "<<< $f <<<"; echo ""; }
           done || true
 
-      - name: Copy web files to repo root (не падает, ставит флаг)
+      - name: Detect SRC and copy web files
         id: copy
         run: |
-          # Тетрадка PP1875 пишет файлы в корень /kaggle/working.
-          # При падении тетрадки output пуст — это достоверный признак сбоя.
-          # У этого справочника 6 файлов (три пары json/gz):
-          #   pp1875.*      — ОКПД2 со статусами нацрежима (основной для фронта);
-          #   pp1875_ref.*  — справочник трёх приложений (тултипы, названия пунктов);
-          #   pp1875_meta.* — метаданные (дата редакции, счётчики, hash).
-          SRC=./output
+          # Тетрадка v-next пишет файлы в /kaggle/working/pp1875_data/web.
+          # Авто-детект ищет pp1875.json в стандартных местах (порядок важен).
+          SRC=""
+          for candidate in ./output/pp1875_data/web ./output/web; do
+            if [ -f "$candidate/pp1875.json" ]; then
+              SRC="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SRC" ]; then
+            echo "::error::pp1875.json не найден ни в ./output/pp1875_data/web, ни в ./output/web — тетрадка упала или не докачалась"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "✅ SRC = $SRC"
+
           MISSING=0
           for f in pp1875.json pp1875.json.gz \
                    pp1875_ref.json pp1875_ref.json.gz \
                    pp1875_meta.json pp1875_meta.json.gz; do
             if [ -f "$SRC/$f" ]; then
               cp "$SRC/$f" "./$f"
-              echo "copied $f"
+              echo "copied $f ($(stat -c%s "$SRC/$f") bytes)"
             else
-              echo "::warning::MISSING $f в output тетрадки (тетрадка, вероятно, упала)"
+              echo "::warning::MISSING $f в $SRC"
               MISSING=$((MISSING+1))
             fi
           done
+
           if [ "$MISSING" -gt 0 ]; then
-            echo "❌ Отсутствует $MISSING из 6 файлов — коммит пропущен, сайт остаётся на последней хорошей версии"
+            echo "❌ Отсутствует $MISSING из 6 файлов — коммит пропущен, сайт на последней хорошей версии"
             echo "FILES_OK=false" >> "$GITHUB_ENV"
           else
             echo "✅ Все 6 файлов на месте"
             echo "FILES_OK=true" >> "$GITHUB_ENV"
           fi
 
-      - name: Commit and push changes
+      - name: Check metadata
+        id: meta
         if: env.FILES_OK == 'true'
+        run: |
+          # publish_allowed=true, critical_errors=[], data_hash_full (64 hex).
+          python <<'PYEOF' > /tmp/meta_ok.txt
+          import json
+          m = json.load(open('pp1875_meta.json'))
+          ok = (
+              bool(m.get('publish_allowed')) and
+              (m.get('critical_errors') == []) and
+              isinstance(m.get('data_hash_full'), str) and
+              len(m.get('data_hash_full') or '') == 64
+          )
+          print('true' if ok else 'false')
+          PYEOF
+          META_OK=$(cat /tmp/meta_ok.txt)
+          echo "META_OK=$META_OK" >> "$GITHUB_ENV"
+
+          if [ "$META_OK" != "true" ]; then
+            python <<'PYEOF'
+          import json
+          m = json.load(open('pp1875_meta.json'))
+          print("critical_errors:", m.get("critical_errors"))
+          print("warnings:", m.get("warnings"))
+          print("publish_allowed:", m.get("publish_allowed"))
+          print("data_hash_full:", m.get("data_hash_full"))
+          PYEOF
+            echo "::error::Мета не готова к публикации — коммит пропущен"
+          else
+            echo "✅ Мета OK: publish_allowed=true, critical_errors=0, data_hash_full=64"
+          fi
+
+      - name: Commit and push changes
+        if: env.FILES_OK == 'true' && env.META_OK == 'true'
         run: |
           git config --local user.email "github-actions@github.com"
           git config --local user.name "GitHub Actions"
@@ -90,13 +133,14 @@ jobs:
           if git diff --cached --quiet; then
             echo "✅ Изменений нет — данные уже актуальны"
           else
-            SOURCE_DATE=$(python -c "import json;print(json.load(open('pp1875_meta.json')).get('source_date','?'))")
+            SOURCE_DATE=$(python -c "import json;m=json.load(open('pp1875_meta.json'));print(m.get('source_date') or m.get('effective_date') or m.get('prepared_date') or m.get('generated_at') or '?')")
+            echo "SOURCE_DATE=$SOURCE_DATE"
             git commit -m "Auto-update: PP 1875 data from kernel output (source $SOURCE_DATE) [skip ci]"
             git push
             echo "✅ Изменения запушены"
           fi
 
-      - name: Trigger new notebook run (fire-and-forget, всегда)
+      - name: Trigger new notebook run (fire-and-forget, always)
         if: always()
         run: |
           mkdir -p ./nb
